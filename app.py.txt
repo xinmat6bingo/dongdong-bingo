@@ -1,0 +1,514 @@
+import re
+import sqlite3
+import requests
+import pandas as pd
+import streamlit as st
+from bs4 import BeautifulSoup
+from collections import Counter, defaultdict
+from itertools import combinations
+from datetime import datetime
+
+DB_NAME = "bingo.db"
+SOURCE_URL = "https://lotto.auzonet.com/bingobingoV1.php"
+
+# ======================
+# 資料庫
+# ======================
+
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS draws (
+            period TEXT PRIMARY KEY,
+            draw_time TEXT,
+            nums TEXT,
+            super_num INTEGER,
+            size_result TEXT,
+            odd_even_result TEXT,
+            created_at TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def save_draw(period, draw_time, nums, super_num, size_result="", odd_even_result=""):
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR REPLACE INTO draws
+        (period, draw_time, nums, super_num, size_result, odd_even_result, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        period,
+        draw_time,
+        ",".join(f"{x:02d}" for x in nums),
+        super_num,
+        size_result,
+        odd_even_result,
+        datetime.now().isoformat()
+    ))
+    conn.commit()
+    conn.close()
+
+def load_draws():
+    conn = sqlite3.connect(DB_NAME)
+    df = pd.read_sql_query("""
+        SELECT * FROM draws
+        ORDER BY period DESC
+    """, conn)
+    conn.close()
+
+    if df.empty:
+        return df
+
+    df["號碼"] = df["nums"].apply(lambda x: [int(n) for n in x.split(",")])
+    df["超級獎號"] = df["super_num"].astype(int)
+    df["期別"] = df["period"]
+    df["時間"] = df["draw_time"]
+    return df
+
+# ======================
+# 自動抓資料
+# ======================
+
+def fetch_latest():
+    headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(SOURCE_URL, headers=headers, timeout=10)
+    r.encoding = "utf-8"
+    soup = BeautifulSoup(r.text, "lxml")
+    text = soup.get_text(" ", strip=True)
+
+    rows = []
+
+    pattern = re.compile(
+        r"(115\d{6})\s+(\d{2}:\d{2})\s+"
+        r"((?:\d{2}\s+){20})(\d{2})"
+    )
+
+    for m in pattern.finditer(text):
+        period = m.group(1)
+        draw_time = m.group(2)
+        nums = [int(x) for x in m.group(3).split()]
+        super_num = int(m.group(4))
+
+        if len(nums) == 20:
+            rows.append({
+                "period": period,
+                "draw_time": draw_time,
+                "nums": nums,
+                "super_num": super_num
+            })
+
+    return rows
+
+def update_latest():
+    rows = fetch_latest()
+    for r in rows:
+        save_draw(
+            r["period"],
+            r["draw_time"],
+            r["nums"],
+            r["super_num"]
+        )
+    return len(rows)
+
+# ======================
+# 分析模型
+# ======================
+
+def hot_cold_analysis(df, n):
+    sample = df.head(n)
+    all_nums = []
+
+    for nums in sample["號碼"]:
+        all_nums.extend(nums)
+
+    counter = Counter(all_nums)
+
+    hot = counter.most_common(20)
+    cold = sorted(
+        [(i, counter.get(i, 0)) for i in range(1, 81)],
+        key=lambda x: x[1]
+    )[:20]
+
+    return hot, cold, counter
+
+def zone_analysis(counter):
+    zones = {}
+    for start in range(1, 81, 10):
+        end = start + 9
+        key = f"{start:02d}-{end:02d}"
+        zones[key] = sum(counter.get(i, 0) for i in range(start, end + 1))
+    return zones
+
+def odd_even_big_small(df, n):
+    sample = df.head(n)
+    all_nums = []
+
+    for nums in sample["號碼"]:
+        all_nums.extend(nums)
+
+    odd = sum(1 for x in all_nums if x % 2 == 1)
+    even = sum(1 for x in all_nums if x % 2 == 0)
+    small = sum(1 for x in all_nums if x <= 40)
+    big = sum(1 for x in all_nums if x >= 41)
+
+    return odd, even, small, big
+
+def ab_transfer(df, n):
+    sample = df.head(n).reset_index(drop=True)
+    score = Counter()
+
+    for i in range(len(sample) - 1):
+        current_nums = sample.loc[i + 1, "號碼"]
+        next_nums = sample.loc[i, "號碼"]
+
+        for a in current_nums:
+            for b in next_nums:
+                score[b] += 1
+
+    return score
+
+def pair_resonance(df, n):
+    sample = df.head(n).reset_index(drop=True)
+    score = Counter()
+
+    for i in range(len(sample) - 1):
+        current_nums = sample.loc[i + 1, "號碼"]
+        next_nums = sample.loc[i, "號碼"]
+
+        for pair in combinations(current_nums, 2):
+            for b in next_nums:
+                score[b] += 1
+
+    return score
+
+def triple_resonance(df, n):
+    sample = df.head(n).reset_index(drop=True)
+    score = Counter()
+
+    for i in range(len(sample) - 1):
+        current_nums = sample.loc[i + 1, "號碼"]
+        next_nums = sample.loc[i, "號碼"]
+
+        for triple in combinations(current_nums, 3):
+            for b in next_nums:
+                score[b] += 1
+
+    return score
+
+def super_mother_analysis(df, target_super):
+    df2 = df.sort_values("期別").reset_index(drop=True)
+
+    hit_indexes = []
+    for i, row in df2.iterrows():
+        if row["超級獎號"] == target_super:
+            hit_indexes.append(i)
+
+    results = []
+
+    if len(hit_indexes) < 2:
+        return None, []
+
+    first_i = hit_indexes[0]
+
+    if first_i + 1 >= len(df2):
+        return None, []
+
+    mother = df2.loc[first_i + 1, "號碼"]
+
+    for idx in hit_indexes[1:]:
+        if idx + 1 < len(df2):
+            next_nums = df2.loc[idx + 1, "號碼"]
+            same = sorted(set(mother) & set(next_nums))
+            results.append({
+                "超級獎號期別": df2.loc[idx, "期別"],
+                "下一期期別": df2.loc[idx + 1, "期別"],
+                "重複顆數": len(same),
+                "重複號碼": same
+            })
+
+    return mother, results
+
+def final_recommendation(df, n):
+    hot, cold, hot_score = hot_cold_analysis(df, n)
+    ab_score = ab_transfer(df, n)
+    pair_score = pair_resonance(df, n)
+    triple_score = triple_resonance(df, n)
+
+    total = Counter()
+
+    for num in range(1, 81):
+        total[num] += hot_score.get(num, 0) * 4
+        total[num] += ab_score.get(num, 0) * 2
+        total[num] += pair_score.get(num, 0) * 1.5
+        total[num] += triple_score.get(num, 0) * 1
+
+    ranked = [num for num, score in total.most_common()]
+
+    recommend_4 = ranked[:4]
+    recommend_5 = ranked[:5]
+    recommend_8 = ranked[:8]
+
+    return recommend_4, recommend_5, recommend_8, total
+
+def backtest(df, n, star_count=4):
+    sample = df.head(n + 1).reset_index(drop=True)
+    results = []
+
+    for i in range(len(sample) - n):
+        train = sample.iloc[i + 1:i + 1 + n].copy()
+        actual = sample.iloc[i]["號碼"]
+
+        if len(train) < n:
+            continue
+
+        rec4, rec5, rec8, _ = final_recommendation(train, n)
+
+        if star_count == 4:
+            rec = rec4
+        elif star_count == 5:
+            rec = rec5
+        else:
+            rec = rec8
+
+        hit = sorted(set(rec) & set(actual))
+
+        results.append({
+            "預測期別": sample.iloc[i]["期別"],
+            "推薦號碼": rec,
+            "實際號碼": actual,
+            "命中顆數": len(hit),
+            "命中號碼": hit
+        })
+
+    return results
+
+# ======================
+# Streamlit UI
+# ======================
+
+st.set_page_config(
+    page_title="東東賓果分析系統",
+    layout="wide"
+)
+
+init_db()
+
+st.title("🎯 東東賓果分析系統 v1.0")
+
+st.caption("功能：自動更新、12/20/30/50/100期分析、四星/五星/八星、A→B、二同/三同、超級獎號母盤、回測")
+
+col_a, col_b = st.columns([1, 3])
+
+with col_a:
+    if st.button("🔄 自動更新最新開獎"):
+        try:
+            count = update_latest()
+            st.success(f"已更新 {count} 筆資料")
+        except Exception as e:
+            st.error(f"更新失敗：{e}")
+
+with col_b:
+    st.info("如果自動抓取失敗，通常是來源網站改版，可先用手動新增資料繼續分析。")
+
+df = load_draws()
+
+# ======================
+# 手動新增
+# ======================
+
+with st.expander("➕ 手動新增一期開獎資料"):
+    period = st.text_input("期別，例如 115030413")
+    draw_time = st.text_input("時間，例如 20:50")
+    nums_text = st.text_area("20個號碼，例如：01,02,11,20,21,26,34,39,45,48,52,55,59,60,61,62,68,72,79,80")
+    super_num = st.number_input("超級獎號", min_value=1, max_value=80, step=1)
+
+    if st.button("儲存手動資料"):
+        try:
+            nums = [int(x) for x in re.findall(r"\d+", nums_text)]
+            if len(nums) != 20:
+                st.error("號碼必須剛好20個")
+            else:
+                save_draw(period, draw_time, nums, super_num)
+                st.success("已儲存")
+                st.rerun()
+        except Exception as e:
+            st.error(f"儲存失敗：{e}")
+
+df = load_draws()
+
+if df.empty:
+    st.warning("目前沒有資料，請先按自動更新，或手動新增一期資料。")
+    st.stop()
+
+# ======================
+# 主分析
+# ======================
+
+period_count = st.selectbox(
+    "選擇分析期數",
+    [12, 20, 30, 50, 100],
+    index=1
+)
+
+st.subheader("📌 最新開獎資料")
+st.dataframe(
+    df[["期別", "時間", "號碼", "超級獎號"]].head(period_count),
+    use_container_width=True
+)
+
+hot, cold, counter = hot_cold_analysis(df, period_count)
+zones = zone_analysis(counter)
+odd, even, small, big = odd_even_big_small(df, period_count)
+rec4, rec5, rec8, final_score = final_recommendation(df, period_count)
+
+c1, c2, c3 = st.columns(3)
+
+with c1:
+    st.subheader("🔥 熱號")
+    st.dataframe(pd.DataFrame(hot, columns=["號碼", "出現次數"]))
+
+with c2:
+    st.subheader("❄️ 冷號")
+    st.dataframe(pd.DataFrame(cold, columns=["號碼", "出現次數"]))
+
+with c3:
+    st.subheader("⚖️ 盤型")
+    st.write(f"單數：{odd}")
+    st.write(f"雙數：{even}")
+    st.write(f"小號 01-40：{small}")
+    st.write(f"大號 41-80：{big}")
+
+    if odd > even:
+        st.success("單雙建議：偏單")
+    elif even > odd:
+        st.success("單雙建議：偏雙")
+    else:
+        st.success("單雙建議：均衡")
+
+    if big > small:
+        st.info("大小建議：偏大")
+    elif small > big:
+        st.info("大小建議：偏小")
+    else:
+        st.info("大小建議：均衡")
+
+st.subheader("📊 區段分布")
+zone_df = pd.DataFrame(list(zones.items()), columns=["區段", "出現次數"])
+st.bar_chart(zone_df.set_index("區段"))
+
+st.subheader("🎯 綜合推薦")
+
+r1, r2, r3 = st.columns(3)
+
+with r1:
+    st.success(f"四星主攻：{' '.join(f'{x:02d}' for x in rec4)}")
+
+with r2:
+    st.info(f"五星穩定：{' '.join(f'{x:02d}' for x in rec5)}")
+
+with r3:
+    st.warning(f"八星包牌：{' '.join(f'{x:02d}' for x in rec8)}")
+
+score_df = pd.DataFrame(
+    [(num, round(score, 2)) for num, score in final_score.most_common(20)],
+    columns=["號碼", "綜合分數"]
+)
+
+st.subheader("🧠 綜合權重排行")
+st.dataframe(score_df, use_container_width=True)
+
+# ======================
+# A→B / 二同 / 三同
+# ======================
+
+with st.expander("🔁 A→B轉移分析"):
+    ab = ab_transfer(df, period_count)
+    ab_df = pd.DataFrame(ab.most_common(20), columns=["號碼", "轉移分數"])
+    st.dataframe(ab_df, use_container_width=True)
+
+with st.expander("🔗 二同共振分析"):
+    pair = pair_resonance(df, period_count)
+    pair_df = pd.DataFrame(pair.most_common(20), columns=["號碼", "二同共振分數"])
+    st.dataframe(pair_df, use_container_width=True)
+
+with st.expander("🔺 三同共振分析"):
+    triple = triple_resonance(df, period_count)
+    triple_df = pd.DataFrame(triple.most_common(20), columns=["號碼", "三同共振分數"])
+    st.dataframe(triple_df, use_container_width=True)
+
+# ======================
+# 超級獎號母盤
+# ======================
+
+st.subheader("⭐ 超級獎號母盤比對法")
+
+target_super = st.number_input(
+    "輸入要分析的超級獎號",
+    min_value=1,
+    max_value=80,
+    value=int(df.iloc[0]["超級獎號"]),
+    step=1
+)
+
+if st.button("執行母盤比對"):
+    mother, results = super_mother_analysis(df, target_super)
+
+    if mother is None:
+        st.warning("資料不足，至少需要同一個超級獎號出現2次以上，且都有下一期資料。")
+    else:
+        st.success(f"母盤號碼：{' '.join(f'{x:02d}' for x in mother)}")
+
+        mother_counter = Counter()
+
+        rows = []
+        for r in results:
+            for x in r["重複號碼"]:
+                mother_counter[x] += 1
+
+            rows.append({
+                "超級獎號期別": r["超級獎號期別"],
+                "下一期期別": r["下一期期別"],
+                "重複顆數": r["重複顆數"],
+                "重複號碼": " ".join(f"{x:02d}" for x in r["重複號碼"])
+            })
+
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+        st.subheader("母盤重複率排行")
+        rank_df = pd.DataFrame(
+            mother_counter.most_common(),
+            columns=["號碼", "重複次數"]
+        )
+        st.dataframe(rank_df, use_container_width=True)
+
+# ======================
+# 回測
+# ======================
+
+st.subheader("🧪 回測")
+
+bt_star = st.selectbox("回測星數", [4, 5, 8], index=0)
+
+if st.button("開始回測"):
+    results = backtest(df, period_count, bt_star)
+
+    if not results:
+        st.warning("資料不足，請先累積更多期數。")
+    else:
+        bt_df = pd.DataFrame(results)
+        bt_df["推薦號碼"] = bt_df["推薦號碼"].apply(lambda x: " ".join(f"{n:02d}" for n in x))
+        bt_df["實際號碼"] = bt_df["實際號碼"].apply(lambda x: " ".join(f"{n:02d}" for n in x))
+        bt_df["命中號碼"] = bt_df["命中號碼"].apply(lambda x: " ".join(f"{n:02d}" for n in x))
+
+        st.dataframe(bt_df, use_container_width=True)
+
+        avg_hit = bt_df["命中顆數"].mean()
+        max_hit = bt_df["命中顆數"].max()
+
+        st.success(f"平均命中：{avg_hit:.2f} 顆")
+        st.success(f"最高命中：{max_hit} 顆")
+
+st.caption("提醒：賓果賓果為隨機遊戲，本系統只做歷史統計、盤型權重與回測分析，不保證中獎。")
